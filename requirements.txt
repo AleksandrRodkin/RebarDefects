@@ -1,0 +1,15 @@
+ipython==9.9.0
+ipykernel==7.1.0
+notebook==7.5.2
+
+tqdm==4.67.1
+
+matplotlib==3.10.6
+seaborn==0.13.2
+
+numpy==2.4.1
+scipy==1.16.2
+pandas==2.3.3
+
+scikit-learn==1.8.0
+statsmodels==0.14.6
