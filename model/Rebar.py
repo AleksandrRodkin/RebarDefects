@@ -5,21 +5,21 @@ from typing import Optional, Tuple, Self
 
 class Rebar():
     """
-        Base class describing a rebar axis in 3D space
+    Base class representing a rebar axis in 3D space.
 
-        The rebar axis is estimated from a set of input points using PCA
+    The rebar axis is estimated from a set of input points using PCA.
+    Additionally, an orthonormal local coordinate system is constructed:
+        - axis_direction: rebar axis direction
+        - v, w: perpendicular unit vectors defining the cross-section plane
     """
 
     def __init__(
             self,
             points: np.ndarray,
-            volume_shape: Tuple[int, int, int],
-            noise_msrt: int = 4,
-            xlim: Optional[Tuple[int, int]] = None,
-            ylim: Optional[Tuple[int, int]] = None,
-            zlim: Optional[Tuple[int, int]] = None,
-            mask: Optional[np.ndarray] = None,
-            noise_mask: Optional[np.ndarray] = None
+            noise_area_thickness: int = 4,
+            noise_area_indent: int = 1,
+            profile_projection: Optional[np.ndarray] = None,
+            noise_msrt_projection: Optional[np.ndarray] = None
     ) -> None:
         """
         Parameters
@@ -28,45 +28,66 @@ class Rebar():
             Array of 3D points lying on the rebar axis.
             Shape: (N, 3).
 
-        volume_shape : tuple[int, int, int]
-            Shape of the 3D volume (Y, X, Z).
-
-        noise_msrt : float, optional
+        noise_area_thickness : int, optional
             Thickness of the noise measurement region around the rebar
             in voxels. Default is 4.
 
-        xlim, ylim, zlim : tuple[int, int] or None, optional
-            Spatial limits for the rebar mask along each axis.
-            Defined as (min, max) voxel indices.
+        noise_area_indent : int, optional
+            Gap between the rebar surface and noise region
+            in voxels. Default is 1.
 
-        mask : np.ndarray or None, optional
-            Boolean mask of the rebar body.
+        profile_projection : np.ndarray, optional
+            Precomputed local cross-section offsets for the rebar profile.
 
-        noise_mask : np.ndarray or None, optional
-            Boolean mask of the noise measurement region.
+        noise_msrt_projection : np.ndarray, optional
+            Precomputed local cross-section offsets for the noise measurement region.
         """
         self.points = points
-        self.xlim = xlim if xlim else (0, volume_shape[0])
-        self.ylim = ylim if ylim else (0, volume_shape[1])
-        self.zlim = zlim if zlim else (0, volume_shape[2])
-        self.volume_shape = volume_shape
-        self.mask = mask
-        self.noise_mask = noise_mask
-        self.noise_msrt = noise_msrt
+        self.profile_projection = profile_projection
+        self.noise_msrt_projection = noise_msrt_projection
+        self.noise_area_thickness = noise_area_thickness
+        self.noise_area_indent = noise_area_indent
+
+        # Estimate axis and construct local basis
         self.direct()
+
+    def orthonormal_basis(self, u):
+        """
+        Construct an orthonormal basis given a direction vector.
+
+        Parameters
+        ----------
+        u : np.ndarray
+            Direction vector.
+
+        Returns
+        -------
+        u, v, w : np.ndarray
+            Orthonormal basis vectors where v ⟂ u, w ⟂ u and v ⟂ w.
+        """
+        u = u / np.linalg.norm(u)
+        # random vector not parallel to u
+        a = np.array([1,0,0]) if abs(u[0]) < 0.9 else np.array([0,1,0])
+        v = np.cross(u, a)
+        v /= np.linalg.norm(v)
+        w = np.cross(u, v)
+        return u, v, w
+
 
     def direct(self) -> Self:
         """
         Estimate the rebar axis.
 
         Computes:
-        - self.direction : unit direction vector of the rebar axis
+        - self.axis_direction : unit direction vector of the rebar axis
         - self.point_on_line : a point lying on the axis
+        -self.v, self.w : perpendicular unit vectors defining local cross-section plane
         """
 
         pca = PCA(n_components=1).fit(self.points)
         self.point_on_line = pca.mean_
-        self.direction = pca.components_[0]
+        self.axis_direction = pca.components_[0]
+        self.axis_direction, self.v, self.w = self.orthonormal_basis(self.axis_direction)
         return self
 
     def dir_validate(self) -> None:
@@ -91,10 +112,10 @@ class Rebar():
         Returns
         -------
         float
-            Distance from the point to the rebar axis.
+            Euclidean distance from the point to the rebar axis.
         """
         v = point - self.point_on_line
-        return np.linalg.norm(v - np.dot(v, self.direction) * self.direction)
+        return np.linalg.norm(v - np.dot(v, self.axis_direction) * self.axis_direction)
 
 
 class RoundRebar(Rebar):
@@ -114,58 +135,57 @@ class RoundRebar(Rebar):
         """
         super().__init__(**kwargs)
         self.radius = radius
-        if self.mask is None or self.noise_mask is None:
-            self.create_mask()
+        if self.profile_projection is None or self.noise_msrt_projection is None:
+            self.create_projections()
 
-    def apply_limits(self, arr: np.ndarray) -> Self:
+    def precompute_circle(self, radius) -> np.ndarray:
         """
-            Apply spatial limits to a boolean mask.
+        Compute integer offsets inside a 2D disk.
 
-            Parameters
-            ----------
-            arr : np.ndarray
-                Boolean mask array to be cropped.
+        Parameters
+        ----------
+        radius : int
+            Circle radius in pixels.
+
+        Returns
+        -------
+        np.ndarray
+            Array of (dx, dy) offsets within the disk.
         """
-        arr[:self.ylim[0]] = False
-        arr[self.ylim[1]:] = False
-        arr[:, :self.xlim[0]] = False
-        arr[:, self.xlim[1]:] = False
-        arr[:, :, :self.zlim[0]] = False
-        arr[:, :, self.zlim[1]:] = False
-        return self
+        offsets = []
+        r2 = radius ** 2
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if dx * dx + dy * dy <= r2:
+                    offsets.append((dx, dy))
+        return np.array(offsets, dtype=np.float32)
 
-    def create_mask(self) -> Self:
+    def create_projections(self) -> Self:
         """
-        Create volumetric masks for the rebar and noise region.
+        Precompute local cross-section projections.
 
-        - mask: voxels inside the rebar radius
-        - noise_mask: voxels in the shell
-          (radius, radius + noise_msrt]
+        - profile_projection: voxel offsets inside the rebar radius
+        - noise_msrt_projection: voxel offsets in the noise measurement shell
+          [radius + indent, radius + indent + thickness]
         """
-        Y, X, Z = np.meshgrid(
-            np.arange(self.volume_shape[0]),  # y
-            np.arange(self.volume_shape[1]),  # x
-            np.arange(self.volume_shape[2]),  # z
-            indexing='ij'
-        )
 
-        dx = X - self.point_on_line[0]
-        dy = Y - self.point_on_line[1]
-        dz = Z - self.point_on_line[2]
+        # rebar cross-section template
+        circle = self.precompute_circle(self.radius)
+        dv = circle[:, 0][:, None]
+        dw = circle[:, 1][:, None]
+        self.profile_projection  = dv * self.v + dw * self.w
 
-        cx = dy * self.direction[2] - dz * self.direction[1]
-        cy = dz * self.direction[0] - dx * self.direction[2]
-        cz = dx * self.direction[1] - dy * self.direction[0]
+        # noise measurement shell template
+        ext_b = self.precompute_circle(self.radius + self.noise_area_indent + self.noise_area_thickness)
+        int_b = self.precompute_circle(self.radius + self.noise_area_indent)
 
-        distances = np.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+        noise_msrt = np.setdiff1d(
+            ext_b.view(np.dtype((np.void, ext_b.dtype.itemsize * 2))),
+            int_b.view(np.dtype((np.void, int_b.dtype.itemsize * 2)))
+        ).view(np.float32).reshape(-1, 2)
 
-        self.mask = np.zeros(self.volume_shape, dtype=bool)
-        self.noise_mask = self.mask.copy()
-
-        self.mask[distances <= self.radius] = True
-        self.noise_mask[(distances > self.radius) & (distances <= self.radius + self.noise_msrt)] = True
-
-        self.apply_limits(self.mask)
-        self.apply_limits(self.noise_mask)
+        dv = noise_msrt[:, 0][:, None]
+        dw = noise_msrt[:, 1][:, None]
+        self.noise_msrt_projection = dv * self.v + dw * self.w
 
         return self
